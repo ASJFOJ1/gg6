@@ -415,13 +415,17 @@ class HawkesProcess:
 
     def fit(self, event_times: np.ndarray):
         """
-        Fit Hawkes process parameters using simplified estimation
+        Fit Hawkes process parameters using Maximum Likelihood Estimation (MLE)
+        with fallback to simplified estimation
         """
         if len(event_times) < 2:
             self.logger.warning("Not enough events to fit Hawkes process")
             return self
         
-        # Basic parameter estimation
+        # Ensure event times are sorted and unique
+        event_times = np.unique(np.sort(event_times))
+        
+        # Basic validation
         T = event_times[-1] - event_times[0]
         N = len(event_times)
         
@@ -429,33 +433,160 @@ class HawkesProcess:
             self.logger.warning("Invalid time range for Hawkes process")
             return self
         
-        # Estimate baseline intensity
-        self.mu = N / T * 0.5  # Conservative estimate
+        if N < 10:
+            self.logger.warning(f"Few events ({N}) for reliable estimation, using simple method")
+            return self._fit_simple(event_times)
+        
+        try:
+            # Try MLE first
+            self._fit_mle(event_times)
+            
+            # Validate fitted parameters
+            if self._validate_parameters():
+                self.logger.info(f"Hawkes MLE fit successful: mu={self.mu:.4f}, alpha={self.alpha:.4f}, beta={self.beta:.4f}")
+                return self
+            else:
+                self.logger.warning("MLE parameters invalid, falling back to simple estimation")
+                return self._fit_simple(event_times)
+                
+        except Exception as e:
+            self.logger.warning(f"MLE fitting failed: {e}, using simple estimation")
+            return self._fit_simple(event_times)
+    
+    def _fit_simple(self, event_times: np.ndarray):
+        """
+        Simple heuristic-based parameter estimation
+        """
+        T = event_times[-1] - event_times[0]
+        N = len(event_times)
+        
+        # Estimate baseline intensity (conservative)
+        self.mu = N / T * 0.3  # More conservative than 0.5
         
         # Estimate alpha and beta using inter-event times
         inter_event_times = np.diff(event_times)
         
-        # Simple heuristic: if events cluster, increase alpha
-        median_iet = np.median(inter_event_times)
-        mean_iet = np.mean(inter_event_times)
+        # Remove outliers (very long inter-event times)
+        iet_75 = np.percentile(inter_event_times, 75)
+        iet_filtered = inter_event_times[inter_event_times <= 3 * iet_75]
+        
+        if len(iet_filtered) < 2:
+            # Fallback to all inter-event times
+            iet_filtered = inter_event_times
+        
+        median_iet = np.median(iet_filtered)
+        mean_iet = np.mean(iet_filtered)
         
         if mean_iet > 0 and median_iet > 0:
-            # Beta controls decay rate - higher beta = faster decay
+            # Beta controls decay rate - estimate from typical gap between events
             self.beta = 1.0 / median_iet
-
-            # If mean >> median, we have clustering
-            clustering_factor = mean_iet / median_iet
             
-            # Estimate alpha based on clustering, but ensure stability
-            # Start with a base alpha estimate
-            estimated_alpha = 0.3 * clustering_factor
+            # Clustering factor with bounds
+            clustering_factor = np.clip(mean_iet / median_iet, 1.0, 3.0)
             
-            # Enforce the stability condition alpha < beta.
-            # We cap alpha at 95% of beta to stay safely subcritical.
-            self.alpha = min(estimated_alpha, 0.95 * self.beta)
+            # Estimate alpha based on clustering
+            # Use more conservative multiplier and ensure stability
+            estimated_alpha = 0.2 * (clustering_factor - 1.0) * self.beta
+            
+            # Enforce stability condition strictly
+            self.alpha = min(estimated_alpha, 0.8 * self.beta)
+        else:
+            # Default stable parameters
+            self.mu = 0.1
+            self.alpha = 0.3
+            self.beta = 1.0
         
-        self.logger.info(f"Hawkes process fitted: mu={self.mu:.4f}, alpha={self.alpha:.4f}, beta={self.beta:.4f}")
+        self.logger.info(f"Hawkes simple fit: mu={self.mu:.4f}, alpha={self.alpha:.4f}, beta={self.beta:.4f}")
         return self
+    
+    def _fit_mle(self, event_times: np.ndarray):
+        """
+        Maximum Likelihood Estimation for Hawkes process parameters
+        """
+        from scipy.optimize import minimize
+        
+        T = event_times[-1] - event_times[0]
+        N = len(event_times)
+        
+        def negative_log_likelihood(params):
+            mu, alpha, beta = params
+            
+            # Enforce constraints
+            if mu <= 0 or alpha <= 0 or beta <= 0 or alpha >= beta:
+                return np.inf
+            
+            # Calculate log-likelihood
+            ll = -mu * T
+            
+            for i in range(N):
+                # Intensity at event time i
+                intensity = mu
+                for j in range(i):
+                    intensity += alpha * np.exp(-beta * (event_times[i] - event_times[j]))
+                
+                if intensity <= 0:
+                    return np.inf
+                
+                ll += np.log(intensity)
+            
+            # Compensator term
+            for i in range(N):
+                ll += alpha / beta * (np.exp(-beta * (T - event_times[i])) - 1)
+            
+            return -ll
+        
+        # Initial guess based on simple estimation
+        self._fit_simple(event_times)
+        x0 = [self.mu, self.alpha, self.beta]
+        
+        # Bounds for parameters
+        bounds = [
+            (0.01, N/T),      # mu bounds
+            (0.01, 5.0),      # alpha bounds  
+            (0.1, 10.0)       # beta bounds
+        ]
+        
+        # Constraint: alpha < beta for stability
+        constraints = {
+            'type': 'ineq',
+            'fun': lambda x: x[2] - x[1] - 0.01  # beta - alpha > 0.01
+        }
+        
+        # Optimize
+        result = minimize(
+            negative_log_likelihood,
+            x0,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': 100}
+        )
+        
+        if result.success:
+            self.mu, self.alpha, self.beta = result.x
+        else:
+            raise ValueError(f"MLE optimization failed: {result.message}")
+    
+    def _validate_parameters(self):
+        """
+        Validate fitted parameters
+        """
+        # Check basic constraints
+        if self.mu <= 0 or self.alpha <= 0 or self.beta <= 0:
+            return False
+        
+        # Check stability (branching ratio < 1)
+        if self.alpha >= self.beta:
+            return False
+        
+        # Check reasonable ranges
+        if self.mu > 100 or self.alpha > 10 or self.beta > 100:
+            return False
+        
+        # Check branching ratio is not too close to 1
+        if self.alpha / self.beta > 0.95:
+            self.logger.warning(f"Branching ratio {self.alpha/self.beta:.3f} is very close to critical")
+        
+        return True
 
     def branching_ratio(self) -> float:
         """
@@ -4826,61 +4957,118 @@ class IntegratedMathematicalAnalysisSystem:
                 f.write(f"Please check error log: {self.error_log_file}\n")
 
     def eemd(self, signal: np.ndarray) -> Dict[str, Any]:
-        """Ensemble Empirical Mode Decomposition"""
-        # Remove forced fallback
-        use_wavelet_fallback = False
-        
+        """Variational Mode Decomposition (VMD) - replacement for EEMD"""
         try:
-            from PyEMD import EEMD
+            import vmdpy
             
-            # Disable parallel processing to avoid conflicts
-            eemd_analyzer = EEMD(parallel=False, trials=50, noise_width=0.05)
-            imfs = eemd_analyzer(signal)
-
+            # VMD parameters for financial time series
+            alpha = 3000      # Bandwidth constraint (higher for financial data to reduce mode mixing)
+            tau = 0.1        # Noise tolerance (small but non-zero for market microstructure noise)
+            K = 6            # Number of modes (6-7 optimal for capturing market cycles)
+            DC = 1           # Include DC component (important for trending markets)
+            init = 1         # Initialize with uniform distribution
+            tol = 1e-6       # Tolerance for convergence (1e-6 is sufficient)
+            
+            # Apply VMD
+            modes, modes_hat, omega = vmdpy.VMD(signal, alpha, tau, K, DC, init, tol)
+            
             # Feature extraction
             dominant_periods = []
             energy_distribution = []
-
-            for imf in imfs[:5]:  # First 5 IMFs
-                # Dominant period via FFT
-                fft = np.fft.fft(imf)
-                freqs = np.fft.fftfreq(len(imf))
-                dominant_freq_idx = np.argmax(np.abs(fft[1:len(fft)//2])) + 1
-                if not self.is_zero(freqs[dominant_freq_idx]):
-                    dominant_period = 1 / freqs[dominant_freq_idx]
+            
+            for i, mode in enumerate(modes):
+                # Dominant period via center frequency
+                if i < len(omega) and len(omega[i]) > 0:
+                    # omega contains instantaneous frequencies
+                    avg_omega = np.mean(omega[i])
+                    if avg_omega > 0:
+                        dominant_period = 2 * np.pi / avg_omega
+                    else:
+                        dominant_period = len(signal)
                 else:
-                    dominant_period = len(imf)
+                    # Fallback: FFT-based period estimation
+                    fft = np.fft.fft(mode)
+                    freqs = np.fft.fftfreq(len(mode))
+                    dominant_freq_idx = np.argmax(np.abs(fft[1:len(fft)//2])) + 1
+                    if freqs[dominant_freq_idx] != 0:
+                        dominant_period = 1 / abs(freqs[dominant_freq_idx])
+                    else:
+                        dominant_period = len(signal)
+                
                 dominant_periods.append(abs(dominant_period))
-
+                
                 # Energy
-                energy = self.safe_divide(np.sum(imf**2), np.sum(signal**2))
+                energy = np.sum(mode**2) / np.sum(signal**2)
                 energy_distribution.append(energy)
-
-            # Trend (residual)
-            trend = signal - np.sum(imfs, axis=0)
-
+            
+            # Trend (sum of lower frequency modes)
+            # In VMD, modes are typically ordered by frequency
+            trend = np.sum(modes[-2:], axis=0)  # Last 2 modes as trend
+            
             # Trend strength
             trend_strength = np.polyfit(np.arange(len(trend)), trend, 1)[0]
-
+            
+            return {
+                'n_imfs': K,  # Keep the same key name for compatibility
+                'dominant_periods': dominant_periods,
+                'energy_distribution': energy_distribution,
+                'trend': trend,
+                'trend_strength': trend_strength,
+                'intrinsic_modes': modes[:3],  # First 3 modes (highest frequency)
+                'center_frequencies': [np.mean(omega[i]) for i in range(K)],
+                'method': 'vmd'
+            }
+            
+        except ImportError:
+            self.logger.warning("vmdpy not available, using wavelet decomposition fallback")
+            # Fallback to wavelet decomposition
+            import pywt
+            
+            # Use wavelet decomposition as alternative
+            coeffs = pywt.wavedec(signal, 'db4', level=5)
+            imfs = []
+            for i, coeff in enumerate(coeffs[1:]):  # Skip approximation
+                # Reconstruct each level
+                rec_coeffs = [np.zeros_like(c) if j != i+1 else c 
+                              for j, c in enumerate(coeffs)]
+                imf = pywt.waverec(rec_coeffs, 'db4', mode='symmetric')
+                # Trim to original length
+                imfs.append(imf[:len(signal)])
+            
+            # Continue with similar analysis structure
+            dominant_periods = []
+            energy_distribution = []
+            
+            for i, imf in enumerate(imfs[:5]):
+                # Estimate period from zero crossings
+                zero_crossings = np.where(np.diff(np.sign(imf)))[0]
+                if len(zero_crossings) > 1:
+                    avg_period = 2 * len(imf) / len(zero_crossings)
+                else:
+                    avg_period = len(imf)
+                dominant_periods.append(avg_period)
+                
+                # Calculate energy
+                energy = np.sum(imf**2) / (np.sum(signal**2) + 1e-10)
+                energy_distribution.append(energy)
+            
+            # Trend is the approximation coefficient
+            trend = pywt.waverec([coeffs[0]] + [np.zeros_like(c) for c in coeffs[1:]], 
+                                'db4', mode='symmetric')[:len(signal)]
+            trend_strength = np.polyfit(np.arange(len(trend)), trend, 1)[0]
+            
             return {
                 'n_imfs': len(imfs),
                 'dominant_periods': dominant_periods,
                 'energy_distribution': energy_distribution,
                 'trend': trend,
                 'trend_strength': trend_strength,
-                'intrinsic_modes': imfs[:3]  # First 3 IMFs
+                'intrinsic_modes': imfs[:3],
+                'method': 'wavelet_fallback'
             }
-
-        except ImportError:
-            self.logger.warning("PyEMD not available, using wavelet fallback")
-            use_wavelet_fallback = True
+            
         except Exception as e:
-            self.logger.warning(f"PyEMD failed: {e}, using wavelet fallback")
-            use_wavelet_fallback = True
-
-        if use_wavelet_fallback:
-            self.logger.info("Using wavelet decomposition instead of EEMD")
-            # Use wavelet decomposition as alternative
+            self.logger.warning(f"VMD failed: {e}, using wavelet decomposition fallback")
             import pywt
             
             # Use wavelet decomposition as alternative
@@ -5863,7 +6051,7 @@ class IntegratedMathematicalAnalysisSystem:
         # Return only non-empty dataframes
         return {k: v for k, v in aligned_data.items() if not v.empty}
 
-def analyze_order_flow_patterns_enhanced(self):
+    def analyze_order_flow_patterns_enhanced(self):
         """Enhanced order flow analysis with new mathematical tools"""
         print("\n[ANALYZING ORDER FLOW PATTERNS - ENHANCED]")
         self.write_to_file("\n" + "="*100)
